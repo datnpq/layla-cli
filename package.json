@@ -1,6 +1,6 @@
 {
   "name": "@datnpq/layla-cli",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Automated Multi-Agent Team Deployment CLI - Setup OpenClaw, 9Router, and manage intelligent worker teams",
   "main": "src/index.js",
   "bin": {
