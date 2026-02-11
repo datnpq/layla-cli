@@ -240,6 +240,41 @@ layla restore --from-gdrive <file-id>
 layla restore backup.tar.gz --new-instances
 ```
 
+## 🛠️ Installation Troubleshooting
+
+### Issue: Native module compilation fails
+
+If you encounter errors during installation related to `ssh2` or native modules:
+
+**Option 1: Install without native SSH (Recommended)**
+```bash
+npm install -g @datnpq/layla-cli
+```
+The CLI will work with manual SSH commands as fallback.
+
+**Option 2: Install with native modules**
+```bash
+npm install -g @datnpq/layla-cli --unsafe-perm
+```
+
+**Option 3: Use npx (no installation)**
+```bash
+npx @datnpq/layla-cli --help
+```
+
+### Issue: Permission denied
+
+```bash
+sudo npm install -g @datnpq/layla-cli
+# or
+npm install -g @datnpq/layla-cli --prefix ~/.local
+```
+
+## 🔄 Version History
+
+- **v1.0.1** - Fixed native module dependencies, made SSH optional
+- **v1.0.0** - Initial release with multi-agent deployment
+
 ## 🛠️ Development
 
 ```bash
