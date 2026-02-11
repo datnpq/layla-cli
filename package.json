@@ -1,0 +1,64 @@
+{
+  "name": "layla-cli",
+  "version": "1.0.0",
+  "description": "Automated Multi-Agent Team Deployment CLI - Setup OpenClaw, 9Router, and manage worker teams",
+  "main": "src/index.js",
+  "bin": {
+    "layla": "./bin/layla.js",
+    "layla-team": "./bin/layla-team.js"
+  },
+  "scripts": {
+    "start": "node bin/layla.js",
+    "test": "jest",
+    "lint": "eslint src/",
+    "build": "pkg . --out-path=dist/"
+  },
+  "keywords": [
+    "openclaw",
+    "multi-agent",
+    "ai",
+    "9router",
+    "automation",
+    "aws",
+    "deployment",
+    "cli"
+  ],
+  "author": "datnpq",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/datnpq/layla-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/datnpq/layla-cli/issues"
+  },
+  "homepage": "https://github.com/datnpq/layla-cli#readme",
+  "dependencies": {
+    "commander": "^11.0.0",
+    "chalk": "^4.1.2",
+    "inquirer": "^8.2.6",
+    "ora": "^5.4.1",
+    "axios": "^1.6.0",
+    "ssh2": "^1.15.0",
+    "node-ssh": "^13.1.0",
+    "aws-sdk": "^2.1500.0",
+    "tar": "^6.2.0",
+    "fs-extra": "^11.1.1",
+    "yaml": "^2.3.4"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "eslint": "^8.54.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "pkg": {
+    "scripts": [
+      "src/**/*.js"
+    ],
+    "assets": [
+      "templates/**/*"
+    ]
+  }
+}

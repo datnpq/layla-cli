@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.DS_Store
+*.log
+*.tar.gz
+layla-backup-*/
+workers-backup-*/
+.vscode/
+.idea/
