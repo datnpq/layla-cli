@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# layla — Switch Claude Code model/endpoint profiles
+# https://github.com/datnpq/layla-cli
+set -euo pipefail
+
+VERSION="1.0.0"
+
+PROFILES_DIR="${LAYLA_PROFILES_DIR:-$HOME/.claude/profiles}"
+SETTINGS_FILE="${LAYLA_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+BACKUP_FILE="$SETTINGS_FILE.bak"
+
+mkdir -p "$PROFILES_DIR"
+
+# Colors
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[32m'
+CYAN='\033[36m'
+YELLOW='\033[33m'
+RED='\033[31m'
+RESET='\033[0m'
+
+# All env keys that layla manages (union of API-key + Vertex)
+ALL_MANAGED_KEYS='["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_USE_VERTEX","CLOUD_ML_REGION","ANTHROPIC_VERTEX_PROJECT_ID","CLAUDE_CODE_SKIP_VERTEX_AUTH"]'
+
+die() { echo -e "${RED}Error:${RESET} $*" >&2; exit 1; }
+
+# Read a JSON key using python3 (supports nested dot notation)
+json_get() {
+  python3 -c "
+import json, sys
+data = json.load(open('$1'))
+keys = '$2'.split('.')
+for k in keys:
+    data = data.get(k, {}) if isinstance(data, dict) else {}
+print(data if isinstance(data, str) else json.dumps(data))
+" 2>/dev/null
+}
+
+# Detect profile type: "vertex" or "apikey"
+profile_type() {
+  local val
+  val=$(json_get "$1" "env.CLAUDE_CODE_USE_VERTEX")
+  if [ "$val" = "1" ] || [ "$val" = "true" ]; then
+    echo "vertex"
+  else
+    echo "apikey"
+  fi
+}
+
+# Detect which profile is currently active by comparing env keys in settings.json
+active_profile() {
+  [ -f "$SETTINGS_FILE" ] || return
+
+  local cur_vertex cur_url cur_token cur_project
+  cur_vertex=$(json_get "$SETTINGS_FILE" "env.CLAUDE_CODE_USE_VERTEX")
+  cur_url=$(json_get "$SETTINGS_FILE" "env.ANTHROPIC_BASE_URL")
+  cur_token=$(json_get "$SETTINGS_FILE" "env.ANTHROPIC_AUTH_TOKEN")
+  cur_project=$(json_get "$SETTINGS_FILE" "env.ANTHROPIC_VERTEX_PROJECT_ID")
+
+  for f in "$PROFILES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local ptype
+    ptype=$(profile_type "$f")
+
+    if [ "$ptype" = "vertex" ]; then
+      local p_project p_region c_region
+      p_project=$(json_get "$f" "env.ANTHROPIC_VERTEX_PROJECT_ID")
+      p_region=$(json_get "$f" "env.CLOUD_ML_REGION")
+      c_region=$(json_get "$SETTINGS_FILE" "env.CLOUD_ML_REGION")
+      if [ "$cur_vertex" = "1" ] && [ "$p_project" = "$cur_project" ] && [ "$p_region" = "$c_region" ]; then
+        basename "$f" .json
+        return
+      fi
+    else
+      local p_url p_token
+      p_url=$(json_get "$f" "env.ANTHROPIC_BASE_URL")
+      p_token=$(json_get "$f" "env.ANTHROPIC_AUTH_TOKEN")
+      if [ "$p_url" = "$cur_url" ] && [ "$p_token" = "$cur_token" ]; then
+        basename "$f" .json
+        return
+      fi
+    fi
+  done
+}
+
+# Format model mappings for display
+model_summary() {
+  local file="$1" compact="${2:-false}"
+  python3 -c "
+import json
+d = json.load(open('$file')).get('env', {})
+parts = []
+mapping = [
+    ('ANTHROPIC_DEFAULT_OPUS_MODEL', 'opus'),
+    ('ANTHROPIC_DEFAULT_SONNET_MODEL', 'sonnet'),
+    ('ANTHROPIC_DEFAULT_HAIKU_MODEL', 'haiku'),
+]
+for key, label in mapping:
+    if key in d:
+        val = d[key]
+        if '$compact' == 'true':
+            parts.append(f'{label}:{val}')
+        else:
+            parts.append(f'{label}\u2192{val}')
+print('  '.join(parts))
+"
+}
+
+# Get endpoint display string for a profile
+profile_endpoint() {
+  local file="$1"
+  local ptype
+  ptype=$(profile_type "$file")
+  if [ "$ptype" = "vertex" ]; then
+    local region project
+    region=$(json_get "$file" "env.CLOUD_ML_REGION")
+    project=$(json_get "$file" "env.ANTHROPIC_VERTEX_PROJECT_ID")
+    echo "vertex:${region}/${project}"
+  else
+    local url
+    url=$(json_get "$file" "env.ANTHROPIC_BASE_URL")
+    python3 -c "
+from urllib.parse import urlparse
+u = urlparse('$url')
+print(u.hostname or '$url')
+" 2>/dev/null
+  fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────
+
+cmd_list() {
+  local interactive="${1:-false}"
+  local active
+  active=$(active_profile)
+  local count=0
+  local names=()
+
+  echo -e "  ${BOLD}Claude Code Profiles${RESET}"
+  echo -e "  ${DIM}$(printf '─%.0s' {1..56})${RESET}"
+
+  for f in "$PROFILES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    count=$((count + 1))
+    local name endpoint models marker ptype tag
+    name=$(basename "$f" .json)
+    names+=("$name")
+    endpoint=$(profile_endpoint "$f")
+    models=$(model_summary "$f" true)
+    ptype=$(profile_type "$f")
+
+    if [ "$ptype" = "vertex" ]; then
+      tag="${CYAN}[vertex]${RESET} "
+    else
+      tag=""
+    fi
+
+    if [ "$name" = "$active" ]; then
+      marker="${GREEN}●${RESET}"
+    else
+      marker=" "
+    fi
+
+    printf "  %b ${DIM}%d)${RESET} %-15s %b${DIM}%-24s${RESET} %s\n" "$marker" "$count" "$name" "$tag" "$endpoint" "$models"
+  done
+
+  echo -e "  ${DIM}$(printf '─%.0s' {1..56})${RESET}"
+
+  if [ "$count" -eq 0 ]; then
+    echo -e "  ${DIM}No profiles found. Use: layla add <name>${RESET}"
+    return
+  fi
+
+  if [ "$interactive" = "true" ]; then
+    echo ""
+    read -rp "  Select [1-$count] or q to cancel: " choice
+    if [ "$choice" = "q" ] || [ -z "$choice" ]; then
+      echo -e "  ${DIM}Cancelled${RESET}"
+      return
+    fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+      die "Invalid selection: $choice"
+    fi
+    local selected="${names[$((choice - 1))]}"
+    if [ "$selected" = "$active" ]; then
+      echo -e "  ${DIM}Already on${RESET} ${GREEN}$selected${RESET}"
+      return
+    fi
+    echo ""
+    cmd_switch "$selected"
+  fi
+}
+
+cmd_switch() {
+  local name="$1"
+  local profile="$PROFILES_DIR/$name.json"
+  [ -f "$profile" ] || die "Profile '$name' not found. Run ${BOLD}layla${RESET} to list."
+
+  # Backup current settings
+  [ -f "$SETTINGS_FILE" ] && cp "$SETTINGS_FILE" "$BACKUP_FILE"
+
+  # Merge profile env into settings.json
+  # Remove ALL managed keys first, then apply profile's env
+  python3 -c "
+import json
+
+with open('$profile') as f:
+    prof = json.load(f)
+
+settings = {}
+try:
+    with open('$SETTINGS_FILE') as f:
+        settings = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
+managed = $ALL_MANAGED_KEYS
+env = settings.get('env', {})
+
+# Remove all managed keys first (clean slate)
+for k in managed:
+    env.pop(k, None)
+
+# Apply profile env
+for k, v in prof.get('env', {}).items():
+    env[k] = v
+
+settings['env'] = env
+
+with open('$SETTINGS_FILE', 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+"
+
+  local ptype models
+  ptype=$(profile_type "$profile")
+  models=$(model_summary "$profile" false)
+
+  echo -e "  ${GREEN}Switched to:${RESET} ${BOLD}$name${RESET}"
+  if [ "$ptype" = "vertex" ]; then
+    echo -e "  ${DIM}Type:${RESET}        ${CYAN}Vertex AI${RESET} (Google OAuth)"
+    echo -e "  ${DIM}Project:${RESET}     $(json_get "$profile" "env.ANTHROPIC_VERTEX_PROJECT_ID")"
+    echo -e "  ${DIM}Region:${RESET}      $(json_get "$profile" "env.CLOUD_ML_REGION")"
+  else
+    echo -e "  ${DIM}Endpoint:${RESET}    $(json_get "$profile" "env.ANTHROPIC_BASE_URL")"
+  fi
+  echo -e "  ${DIM}Models:${RESET}      $models"
+  echo -e "  ${YELLOW}Note:${RESET}        Restart Claude Code to apply"
+}
+
+cmd_status() {
+  local active
+  active=$(active_profile)
+
+  if [ -z "$active" ]; then
+    echo -e "  ${YELLOW}No matching profile detected${RESET}"
+    echo -e "  ${DIM}Current settings may have been manually edited${RESET}"
+  else
+    local profile="$PROFILES_DIR/$active.json"
+    local desc ptype models
+    desc=$(json_get "$profile" "description")
+    ptype=$(profile_type "$profile")
+    models=$(model_summary "$profile" false)
+
+    echo -e "  ${BOLD}Active Profile:${RESET} ${GREEN}$active${RESET}"
+    [ -n "$desc" ] && [ "$desc" != "{}" ] && echo -e "  ${DIM}Description:${RESET}    $desc"
+    if [ "$ptype" = "vertex" ]; then
+      echo -e "  ${DIM}Type:${RESET}           ${CYAN}Vertex AI${RESET}"
+      echo -e "  ${DIM}Project:${RESET}        $(json_get "$profile" "env.ANTHROPIC_VERTEX_PROJECT_ID")"
+      echo -e "  ${DIM}Region:${RESET}         $(json_get "$profile" "env.CLOUD_ML_REGION")"
+    else
+      echo -e "  ${DIM}Endpoint:${RESET}       $(json_get "$profile" "env.ANTHROPIC_BASE_URL")"
+    fi
+    echo -e "  ${DIM}Models:${RESET}         $models"
+  fi
+}
+
+cmd_add() {
+  local name="$1"
+  local profile="$PROFILES_DIR/$name.json"
+  [ -f "$profile" ] && die "Profile '$name' already exists."
+
+  echo -e "  ${BOLD}Create profile: $name${RESET}\n"
+  echo -e "  ${DIM}Profile type:${RESET}"
+  echo "    1) API Key (Anthropic-compatible proxy)"
+  echo "    2) Vertex AI (Google Cloud)"
+  read -rp "  Choose [1/2]: " ptype_choice
+
+  if [ "$ptype_choice" = "2" ]; then
+    read -rp "  Description: " desc
+    read -rp "  GCP Project ID: " project_id
+    read -rp "  Region [global]: " region
+    region="${region:-global}"
+    read -rp "  Opus model [claude-opus-4-6]: " opus_model
+    read -rp "  Sonnet model [claude-sonnet-4-6]: " sonnet_model
+    read -rp "  Haiku model [claude-haiku-4-5@20251001]: " haiku_model
+
+    opus_model="${opus_model:-claude-opus-4-6}"
+    sonnet_model="${sonnet_model:-claude-sonnet-4-6}"
+    haiku_model="${haiku_model:-claude-haiku-4-5@20251001}"
+
+    python3 -c "
+import json
+profile = {
+    'description': '''$desc''',
+    'env': {
+        'CLAUDE_CODE_USE_VERTEX': '1',
+        'CLOUD_ML_REGION': '$region',
+        'ANTHROPIC_VERTEX_PROJECT_ID': '$project_id',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL': '$opus_model',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL': '$sonnet_model',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL': '$haiku_model',
+    }
+}
+with open('$profile', 'w') as f:
+    json.dump(profile, f, indent=2)
+    f.write('\n')
+"
+  else
+    read -rp "  Description: " desc
+    read -rp "  Base URL (e.g. https://api.example.com): " base_url
+    read -rp "  API Key: " api_key
+    read -rp "  Opus model [claude-opus-4-6]: " opus_model
+    read -rp "  Sonnet model [claude-sonnet-4-6]: " sonnet_model
+    read -rp "  Haiku model [claude-haiku-4-5]: " haiku_model
+
+    opus_model="${opus_model:-claude-opus-4-6}"
+    sonnet_model="${sonnet_model:-claude-sonnet-4-6}"
+    haiku_model="${haiku_model:-claude-haiku-4-5}"
+
+    python3 -c "
+import json
+profile = {
+    'description': '''$desc''',
+    'env': {
+        'ANTHROPIC_BASE_URL': '$base_url',
+        'ANTHROPIC_AUTH_TOKEN': '$api_key',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL': '$opus_model',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL': '$sonnet_model',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL': '$haiku_model',
+    }
+}
+with open('$profile', 'w') as f:
+    json.dump(profile, f, indent=2)
+    f.write('\n')
+"
+  fi
+
+  echo -e "\n  ${GREEN}Created:${RESET} $profile"
+}
+
+cmd_rm() {
+  local name="$1"
+  local profile="$PROFILES_DIR/$name.json"
+  [ -f "$profile" ] || die "Profile '$name' not found."
+
+  local active
+  active=$(active_profile)
+  [ "$name" = "$active" ] && die "Cannot remove active profile. Switch first."
+
+  rm "$profile"
+  echo -e "  ${GREEN}Removed:${RESET} $name"
+}
+
+# ── Main ──────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  "")         cmd_list true ;;
+  list)       cmd_list false ;;
+  status)     cmd_status ;;
+  add)        [ -z "${2:-}" ] && die "Usage: layla add <name>"; cmd_add "$2" ;;
+  rm|remove)  [ -z "${2:-}" ] && die "Usage: layla rm <name>"; cmd_rm "$2" ;;
+  version|-v|--version)
+    echo "layla $VERSION"
+    ;;
+  help|-h|--help)
+    echo -e "  ${BOLD}layla${RESET} — Switch Claude Code profiles\n"
+    echo -e "  ${BOLD}Usage:${RESET}"
+    echo "    layla                 Interactive profile selector"
+    echo "    layla <name>          Switch to profile"
+    echo "    layla list            List profiles (non-interactive)"
+    echo "    layla status          Show active profile details"
+    echo "    layla add <name>      Create new profile (interactive)"
+    echo "    layla rm <name>       Remove a profile"
+    echo "    layla version         Show version"
+    echo "    layla help            Show this help"
+    echo ""
+    echo -e "  ${BOLD}Profile types:${RESET}"
+    echo "    API Key   — ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN"
+    echo "    Vertex AI — CLAUDE_CODE_USE_VERTEX + GCP project (Google OAuth)"
+    echo ""
+    echo -e "  ${BOLD}Environment:${RESET}"
+    echo "    LAYLA_PROFILES_DIR    Profile directory (default: ~/.claude/profiles)"
+    echo "    LAYLA_SETTINGS_FILE   Settings file (default: ~/.claude/settings.json)"
+    ;;
+  *)          cmd_switch "$1" ;;
+esac

@@ -1,0 +1,37 @@
+{
+  "name": "layla-cli",
+  "version": "1.0.0",
+  "description": "Switch Claude Code model/endpoint profiles. Supports API-key providers and Google Vertex AI.",
+  "bin": {
+    "layla": "bin/layla"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "vertex-ai",
+    "cli",
+    "profile-switcher",
+    "llm"
+  ],
+  "author": "datnpq",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/datnpq/layla-cli.git"
+  },
+  "homepage": "https://github.com/datnpq/layla-cli#readme",
+  "bugs": {
+    "url": "https://github.com/datnpq/layla-cli/issues"
+  },
+  "files": [
+    "bin/layla"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}
