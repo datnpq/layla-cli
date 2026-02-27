@@ -3,29 +3,81 @@
 # https://github.com/datnpq/layla-cli
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 PROFILES_DIR="${LAYLA_PROFILES_DIR:-$HOME/.claude/profiles}"
 SETTINGS_FILE="${LAYLA_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+BACKUP_DIR="$HOME/.claude/.layla-backups"
 BACKUP_FILE="$SETTINGS_FILE.bak"
+UPDATE_CACHE="$HOME/.claude/.layla-update-check"
 
-mkdir -p "$PROFILES_DIR"
+# ── Auto-recovery: ensure dirs exist ─────────────────────────────
+mkdir -p "$PROFILES_DIR" "$BACKUP_DIR"
+[ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
 
-# Colors
-BOLD='\033[1m'
-DIM='\033[2m'
-GREEN='\033[32m'
-CYAN='\033[36m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
+# Validate settings.json is valid JSON, restore from backup if corrupted
+if ! python3 -c "import json; json.load(open('$SETTINGS_FILE'))" 2>/dev/null; then
+  if [ -f "$BACKUP_FILE" ] && python3 -c "import json; json.load(open('$BACKUP_FILE'))" 2>/dev/null; then
+    cp "$BACKUP_FILE" "$SETTINGS_FILE"
+  else
+    echo '{}' > "$SETTINGS_FILE"
+  fi
+fi
 
-# All env keys that layla manages (union of API-key + Vertex)
+# ── Colors (TTY-aware, respects NO_COLOR) ────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD='\033[1m' DIM='\033[2m' GREEN='\033[32m' CYAN='\033[36m'
+  YELLOW='\033[33m' RED='\033[31m' BLUE='\033[34m' RESET='\033[0m'
+else
+  BOLD='' DIM='' GREEN='' CYAN='' YELLOW='' RED='' BLUE='' RESET=''
+fi
+
+# All env keys that layla manages
 ALL_MANAGED_KEYS='["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_USE_VERTEX","CLOUD_ML_REGION","ANTHROPIC_VERTEX_PROJECT_ID","CLAUDE_CODE_SKIP_VERTEX_AUTH"]'
 
-die() { echo -e "${RED}Error:${RESET} $*" >&2; exit 1; }
+die() { echo -e "  ${RED}[X]${RESET} $*" >&2; exit 1; }
+ok()  { echo -e "  ${GREEN}[OK]${RESET} $*"; }
+warn(){ echo -e "  ${YELLOW}[!]${RESET}  $*"; }
+info(){ echo -e "  ${CYAN}[i]${RESET}  $*"; }
 
-# Read a JSON key using python3 (supports nested dot notation)
+# ── Update check (non-blocking, cached) ──────────────────────────
+check_update_bg() {
+  # Only check once per day, skip in CI
+  [ -n "${CI:-}" ] && return
+  local now
+  now=$(date +%s)
+  if [ -f "$UPDATE_CACHE" ]; then
+    local cached_time
+    cached_time=$(head -1 "$UPDATE_CACHE" 2>/dev/null || echo 0)
+    local age=$(( now - cached_time ))
+    [ "$age" -lt 86400 ] && return
+  fi
+  # Background check
+  (
+    local latest
+    latest=$(npm view layla-cli version 2>/dev/null || echo "")
+    if [ -n "$latest" ] && [ "$latest" != "$VERSION" ]; then
+      echo "$now" > "$UPDATE_CACHE"
+      echo "$latest" >> "$UPDATE_CACHE"
+    else
+      echo "$now" > "$UPDATE_CACHE"
+      echo "" >> "$UPDATE_CACHE"
+    fi
+  ) &
+  disown 2>/dev/null
+}
+
+show_update_notice() {
+  [ -f "$UPDATE_CACHE" ] || return
+  local latest
+  latest=$(tail -1 "$UPDATE_CACHE" 2>/dev/null || echo "")
+  if [ -n "$latest" ] && [ "$latest" != "$VERSION" ]; then
+    echo ""
+    info "Update available: ${DIM}$VERSION${RESET} -> ${GREEN}$latest${RESET}  Run: ${BOLD}npm update -g layla-cli${RESET}"
+  fi
+}
+
+# ── JSON helpers ─────────────────────────────────────────────────
 json_get() {
   python3 -c "
 import json, sys
@@ -37,98 +89,109 @@ print(data if isinstance(data, str) else json.dumps(data))
 " 2>/dev/null
 }
 
-# Detect profile type: "vertex" or "apikey"
+# ── Profile helpers ──────────────────────────────────────────────
 profile_type() {
   local val
   val=$(json_get "$1" "env.CLAUDE_CODE_USE_VERTEX")
-  if [ "$val" = "1" ] || [ "$val" = "true" ]; then
-    echo "vertex"
-  else
-    echo "apikey"
-  fi
+  if [ "$val" = "1" ] || [ "$val" = "true" ]; then echo "vertex"; else echo "apikey"; fi
 }
 
-# Detect which profile is currently active by comparing env keys in settings.json
+# Get all profile names as array
+profile_names() {
+  local names=()
+  for f in "$PROFILES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    names+=("$(basename "$f" .json)")
+  done
+  echo "${names[@]}"
+}
+
 active_profile() {
   [ -f "$SETTINGS_FILE" ] || return
-
   local cur_vertex cur_url cur_token cur_project
   cur_vertex=$(json_get "$SETTINGS_FILE" "env.CLAUDE_CODE_USE_VERTEX")
   cur_url=$(json_get "$SETTINGS_FILE" "env.ANTHROPIC_BASE_URL")
   cur_token=$(json_get "$SETTINGS_FILE" "env.ANTHROPIC_AUTH_TOKEN")
   cur_project=$(json_get "$SETTINGS_FILE" "env.ANTHROPIC_VERTEX_PROJECT_ID")
-
   for f in "$PROFILES_DIR"/*.json; do
     [ -f "$f" ] || continue
     local ptype
     ptype=$(profile_type "$f")
-
     if [ "$ptype" = "vertex" ]; then
       local p_project p_region c_region
       p_project=$(json_get "$f" "env.ANTHROPIC_VERTEX_PROJECT_ID")
       p_region=$(json_get "$f" "env.CLOUD_ML_REGION")
       c_region=$(json_get "$SETTINGS_FILE" "env.CLOUD_ML_REGION")
       if [ "$cur_vertex" = "1" ] && [ "$p_project" = "$cur_project" ] && [ "$p_region" = "$c_region" ]; then
-        basename "$f" .json
-        return
+        basename "$f" .json; return
       fi
     else
       local p_url p_token
       p_url=$(json_get "$f" "env.ANTHROPIC_BASE_URL")
       p_token=$(json_get "$f" "env.ANTHROPIC_AUTH_TOKEN")
       if [ "$p_url" = "$cur_url" ] && [ "$p_token" = "$cur_token" ]; then
-        basename "$f" .json
-        return
+        basename "$f" .json; return
       fi
     fi
   done
 }
 
-# Format model mappings for display
 model_summary() {
   local file="$1" compact="${2:-false}"
   python3 -c "
 import json
 d = json.load(open('$file')).get('env', {})
 parts = []
-mapping = [
-    ('ANTHROPIC_DEFAULT_OPUS_MODEL', 'opus'),
-    ('ANTHROPIC_DEFAULT_SONNET_MODEL', 'sonnet'),
-    ('ANTHROPIC_DEFAULT_HAIKU_MODEL', 'haiku'),
-]
-for key, label in mapping:
+for key, label in [('ANTHROPIC_DEFAULT_OPUS_MODEL','opus'),('ANTHROPIC_DEFAULT_SONNET_MODEL','sonnet'),('ANTHROPIC_DEFAULT_HAIKU_MODEL','haiku')]:
     if key in d:
         val = d[key]
-        if '$compact' == 'true':
-            parts.append(f'{label}:{val}')
-        else:
-            parts.append(f'{label}\u2192{val}')
+        parts.append(f'{label}:{val}' if '$compact' == 'true' else f'{label}\u2192{val}')
 print('  '.join(parts))
 "
 }
 
-# Get endpoint display string for a profile
 profile_endpoint() {
-  local file="$1"
-  local ptype
+  local file="$1" ptype
   ptype=$(profile_type "$file")
   if [ "$ptype" = "vertex" ]; then
-    local region project
-    region=$(json_get "$file" "env.CLOUD_ML_REGION")
-    project=$(json_get "$file" "env.ANTHROPIC_VERTEX_PROJECT_ID")
-    echo "vertex:${region}/${project}"
+    echo "vertex:$(json_get "$file" "env.CLOUD_ML_REGION")/$(json_get "$file" "env.ANTHROPIC_VERTEX_PROJECT_ID")"
   else
     local url
     url=$(json_get "$file" "env.ANTHROPIC_BASE_URL")
-    python3 -c "
-from urllib.parse import urlparse
-u = urlparse('$url')
-print(u.hostname or '$url')
-" 2>/dev/null
+    python3 -c "from urllib.parse import urlparse; print(urlparse('$url').hostname or '$url')" 2>/dev/null
   fi
 }
 
-# ── Commands ──────────────────────────────────────────────────────
+# ── Fuzzy match ──────────────────────────────────────────────────
+fuzzy_suggest() {
+  local input="$1"
+  python3 -c "
+import os, json
+
+def levenshtein(s1, s2):
+    if len(s1) < len(s2): return levenshtein(s2, s1)
+    if len(s2) == 0: return len(s1)
+    prev = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        curr = [i + 1]
+        for j, c2 in enumerate(s2):
+            curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(c1!=c2)))
+        prev = curr
+    return prev[-1]
+
+profiles_dir = '$PROFILES_DIR'
+names = [f[:-5] for f in os.listdir(profiles_dir) if f.endswith('.json')]
+if not names:
+    exit()
+scored = [(n, levenshtein('$input'.lower(), n.lower())) for n in names]
+scored.sort(key=lambda x: x[1])
+best = scored[0]
+if best[1] <= max(3, len('$input') // 2):
+    print(best[0])
+" 2>/dev/null
+}
+
+# ── Commands ─────────────────────────────────────────────────────
 
 cmd_list() {
   local interactive="${1:-false}"
@@ -149,26 +212,15 @@ cmd_list() {
     endpoint=$(profile_endpoint "$f")
     models=$(model_summary "$f" true)
     ptype=$(profile_type "$f")
-
-    if [ "$ptype" = "vertex" ]; then
-      tag="${CYAN}[vertex]${RESET} "
-    else
-      tag=""
-    fi
-
-    if [ "$name" = "$active" ]; then
-      marker="${GREEN}●${RESET}"
-    else
-      marker=" "
-    fi
-
+    if [ "$ptype" = "vertex" ]; then tag="${CYAN}[vertex]${RESET} "; else tag=""; fi
+    if [ "$name" = "$active" ]; then marker="${GREEN}●${RESET}"; else marker=" "; fi
     printf "  %b ${DIM}%d)${RESET} %-15s %b${DIM}%-24s${RESET} %s\n" "$marker" "$count" "$name" "$tag" "$endpoint" "$models"
   done
 
   echo -e "  ${DIM}$(printf '─%.0s' {1..56})${RESET}"
 
   if [ "$count" -eq 0 ]; then
-    echo -e "  ${DIM}No profiles found. Use: layla add <name>${RESET}"
+    info "No profiles found. Use: ${BOLD}layla add <name>${RESET}"
     return
   fi
 
@@ -176,16 +228,14 @@ cmd_list() {
     echo ""
     read -rp "  Select [1-$count] or q to cancel: " choice
     if [ "$choice" = "q" ] || [ -z "$choice" ]; then
-      echo -e "  ${DIM}Cancelled${RESET}"
-      return
+      echo -e "  ${DIM}Cancelled${RESET}"; return
     fi
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
       die "Invalid selection: $choice"
     fi
     local selected="${names[$((choice - 1))]}"
     if [ "$selected" = "$active" ]; then
-      echo -e "  ${DIM}Already on${RESET} ${GREEN}$selected${RESET}"
-      return
+      echo -e "  ${DIM}Already on${RESET} ${GREEN}$selected${RESET}"; return
     fi
     echo ""
     cmd_switch "$selected"
@@ -195,39 +245,39 @@ cmd_list() {
 cmd_switch() {
   local name="$1"
   local profile="$PROFILES_DIR/$name.json"
-  [ -f "$profile" ] || die "Profile '$name' not found. Run ${BOLD}layla${RESET} to list."
 
-  # Backup current settings
-  [ -f "$SETTINGS_FILE" ] && cp "$SETTINGS_FILE" "$BACKUP_FILE"
+  # Fuzzy match if not found
+  if [ ! -f "$profile" ]; then
+    local suggestion
+    suggestion=$(fuzzy_suggest "$name")
+    if [ -n "$suggestion" ]; then
+      die "Profile '$name' not found. Did you mean: ${BOLD}$suggestion${RESET}?"
+    else
+      die "Profile '$name' not found. Run ${BOLD}layla${RESET} to list."
+    fi
+  fi
 
-  # Merge profile env into settings.json
-  # Remove ALL managed keys first, then apply profile's env
+  # Timestamped backup
+  if [ -f "$SETTINGS_FILE" ]; then
+    cp "$SETTINGS_FILE" "$BACKUP_FILE"
+    cp "$SETTINGS_FILE" "$BACKUP_DIR/settings.$(date +%Y%m%d-%H%M%S).json"
+  fi
+
+  # Keep only last 10 backups
+  ls -1t "$BACKUP_DIR"/settings.*.json 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true
+
   python3 -c "
 import json
-
-with open('$profile') as f:
-    prof = json.load(f)
-
+with open('$profile') as f: prof = json.load(f)
 settings = {}
 try:
-    with open('$SETTINGS_FILE') as f:
-        settings = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    pass
-
+    with open('$SETTINGS_FILE') as f: settings = json.load(f)
+except: pass
 managed = $ALL_MANAGED_KEYS
 env = settings.get('env', {})
-
-# Remove all managed keys first (clean slate)
-for k in managed:
-    env.pop(k, None)
-
-# Apply profile env
-for k, v in prof.get('env', {}).items():
-    env[k] = v
-
+for k in managed: env.pop(k, None)
+for k, v in prof.get('env', {}).items(): env[k] = v
 settings['env'] = env
-
 with open('$SETTINGS_FILE', 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
@@ -252,17 +302,15 @@ with open('$SETTINGS_FILE', 'w') as f:
 cmd_status() {
   local active
   active=$(active_profile)
-
   if [ -z "$active" ]; then
-    echo -e "  ${YELLOW}No matching profile detected${RESET}"
-    echo -e "  ${DIM}Current settings may have been manually edited${RESET}"
+    warn "No matching profile detected"
+    info "Current settings may have been manually edited"
   else
     local profile="$PROFILES_DIR/$active.json"
     local desc ptype models
     desc=$(json_get "$profile" "description")
     ptype=$(profile_type "$profile")
     models=$(model_summary "$profile" false)
-
     echo -e "  ${BOLD}Active Profile:${RESET} ${GREEN}$active${RESET}"
     [ -n "$desc" ] && [ "$desc" != "{}" ] && echo -e "  ${DIM}Description:${RESET}    $desc"
     if [ "$ptype" = "vertex" ]; then
@@ -282,7 +330,6 @@ cmd_add() {
   [ -f "$profile" ] && die "Profile '$name' already exists."
 
   echo -e "  ${BOLD}Create profile: $name${RESET}\n"
-  echo -e "  ${DIM}Profile type:${RESET}"
   echo "    1) API Key (Anthropic-compatible proxy)"
   echo "    2) Vertex AI (Google Cloud)"
   read -rp "  Choose [1/2]: " ptype_choice
@@ -295,104 +342,531 @@ cmd_add() {
     read -rp "  Opus model [claude-opus-4-6]: " opus_model
     read -rp "  Sonnet model [claude-sonnet-4-6]: " sonnet_model
     read -rp "  Haiku model [claude-haiku-4-5@20251001]: " haiku_model
-
-    opus_model="${opus_model:-claude-opus-4-6}"
-    sonnet_model="${sonnet_model:-claude-sonnet-4-6}"
-    haiku_model="${haiku_model:-claude-haiku-4-5@20251001}"
-
     python3 -c "
 import json
 profile = {
-    'description': '''$desc''',
+    'description': '''${desc}''',
     'env': {
         'CLAUDE_CODE_USE_VERTEX': '1',
-        'CLOUD_ML_REGION': '$region',
+        'CLOUD_ML_REGION': '${region:-global}',
         'ANTHROPIC_VERTEX_PROJECT_ID': '$project_id',
-        'ANTHROPIC_DEFAULT_OPUS_MODEL': '$opus_model',
-        'ANTHROPIC_DEFAULT_SONNET_MODEL': '$sonnet_model',
-        'ANTHROPIC_DEFAULT_HAIKU_MODEL': '$haiku_model',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL': '${opus_model:-claude-opus-4-6}',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL': '${sonnet_model:-claude-sonnet-4-6}',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL': '${haiku_model:-claude-haiku-4-5@20251001}',
     }
 }
 with open('$profile', 'w') as f:
-    json.dump(profile, f, indent=2)
-    f.write('\n')
+    json.dump(profile, f, indent=2); f.write('\n')
 "
   else
     read -rp "  Description: " desc
-    read -rp "  Base URL (e.g. https://api.example.com): " base_url
+    read -rp "  Base URL: " base_url
     read -rp "  API Key: " api_key
     read -rp "  Opus model [claude-opus-4-6]: " opus_model
     read -rp "  Sonnet model [claude-sonnet-4-6]: " sonnet_model
     read -rp "  Haiku model [claude-haiku-4-5]: " haiku_model
-
-    opus_model="${opus_model:-claude-opus-4-6}"
-    sonnet_model="${sonnet_model:-claude-sonnet-4-6}"
-    haiku_model="${haiku_model:-claude-haiku-4-5}"
-
     python3 -c "
 import json
 profile = {
-    'description': '''$desc''',
+    'description': '''${desc}''',
     'env': {
         'ANTHROPIC_BASE_URL': '$base_url',
         'ANTHROPIC_AUTH_TOKEN': '$api_key',
-        'ANTHROPIC_DEFAULT_OPUS_MODEL': '$opus_model',
-        'ANTHROPIC_DEFAULT_SONNET_MODEL': '$sonnet_model',
-        'ANTHROPIC_DEFAULT_HAIKU_MODEL': '$haiku_model',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL': '${opus_model:-claude-opus-4-6}',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL': '${sonnet_model:-claude-sonnet-4-6}',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL': '${haiku_model:-claude-haiku-4-5}',
     }
 }
 with open('$profile', 'w') as f:
-    json.dump(profile, f, indent=2)
-    f.write('\n')
+    json.dump(profile, f, indent=2); f.write('\n')
 "
   fi
-
-  echo -e "\n  ${GREEN}Created:${RESET} $profile"
+  ok "Created: $profile"
 }
 
 cmd_rm() {
   local name="$1"
   local profile="$PROFILES_DIR/$name.json"
   [ -f "$profile" ] || die "Profile '$name' not found."
-
   local active
   active=$(active_profile)
   [ "$name" = "$active" ] && die "Cannot remove active profile. Switch first."
-
   rm "$profile"
-  echo -e "  ${GREEN}Removed:${RESET} $name"
+  ok "Removed: $name"
 }
 
-# ── Main ──────────────────────────────────────────────────────────
+# ── Doctor ───────────────────────────────────────────────────────
+
+cmd_doctor() {
+  local fix="${1:-}"
+  local issues=0
+
+  echo -e "\n  ${BOLD}Layla Doctor${RESET}"
+  echo -e "  ${DIM}$(printf '─%.0s' {1..40})${RESET}\n"
+
+  # 1. Python3
+  if command -v python3 &>/dev/null; then
+    ok "python3 found: $(python3 --version 2>&1)"
+  else
+    die "python3 not found. Required for JSON handling."
+  fi
+
+  # 2. Profiles dir
+  if [ -d "$PROFILES_DIR" ]; then
+    local pcount
+    pcount=$(ls "$PROFILES_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+    ok "Profiles directory: $pcount profile(s)"
+  else
+    issues=$((issues + 1))
+    if [ "$fix" = "--fix" ]; then
+      mkdir -p "$PROFILES_DIR"
+      ok "Created profiles directory (fixed)"
+    else
+      warn "Profiles directory missing: $PROFILES_DIR"
+    fi
+  fi
+
+  # 3. Settings file
+  if [ -f "$SETTINGS_FILE" ]; then
+    if python3 -c "import json; json.load(open('$SETTINGS_FILE'))" 2>/dev/null; then
+      ok "settings.json: valid JSON"
+    else
+      issues=$((issues + 1))
+      if [ "$fix" = "--fix" ]; then
+        if [ -f "$BACKUP_FILE" ]; then
+          cp "$BACKUP_FILE" "$SETTINGS_FILE"
+          ok "settings.json restored from backup (fixed)"
+        else
+          echo '{}' > "$SETTINGS_FILE"
+          ok "settings.json reset to empty (fixed)"
+        fi
+      else
+        warn "settings.json: invalid JSON"
+      fi
+    fi
+  else
+    issues=$((issues + 1))
+    if [ "$fix" = "--fix" ]; then
+      echo '{}' > "$SETTINGS_FILE"
+      ok "Created settings.json (fixed)"
+    else
+      warn "settings.json not found"
+    fi
+  fi
+
+  # 4. Validate each profile
+  for f in "$PROFILES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local pname
+    pname=$(basename "$f" .json)
+    if python3 -c "
+import json
+d = json.load(open('$f'))
+assert 'env' in d, 'missing env'
+" 2>/dev/null; then
+      ok "Profile $pname: valid"
+    else
+      issues=$((issues + 1))
+      warn "Profile $pname: invalid JSON or missing 'env' key"
+    fi
+  done
+
+  # 5. Vertex profiles: check gcloud
+  for f in "$PROFILES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local ptype
+    ptype=$(profile_type "$f")
+    if [ "$ptype" = "vertex" ]; then
+      local pname
+      pname=$(basename "$f" .json)
+      if command -v gcloud &>/dev/null; then
+        if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
+          ok "Vertex ($pname): gcloud credentials found"
+        else
+          issues=$((issues + 1))
+          warn "Vertex ($pname): no gcloud credentials. Run: gcloud auth application-default login"
+        fi
+      else
+        issues=$((issues + 1))
+        warn "Vertex ($pname): gcloud CLI not installed. Run: brew install google-cloud-sdk"
+      fi
+      break  # Only check once
+    fi
+  done
+
+  # 6. Backup dir
+  if [ -d "$BACKUP_DIR" ]; then
+    local bcount
+    bcount=$(find "$BACKUP_DIR" -name 'settings.*.json' 2>/dev/null | wc -l | tr -d ' ')
+    ok "Backups: $bcount saved"
+  fi
+
+  # 7. Active profile
+  local active
+  active=$(active_profile)
+  if [ -n "$active" ]; then
+    ok "Active profile: $active"
+  else
+    warn "No active profile detected"
+  fi
+
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    ok "All checks passed"
+  else
+    warn "$issues issue(s) found"
+    [ "$fix" != "--fix" ] && info "Run ${BOLD}layla doctor --fix${RESET} to auto-repair"
+  fi
+  echo ""
+}
+
+# ── Test ─────────────────────────────────────────────────────────
+
+cmd_test() {
+  local target="${1:-}"
+
+  echo -e "\n  ${BOLD}API Health Check${RESET}"
+  echo -e "  ${DIM}$(printf '─%.0s' {1..40})${RESET}\n"
+
+  for f in "$PROFILES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local pname ptype
+    pname=$(basename "$f" .json)
+
+    # If target specified, only test that one
+    [ -n "$target" ] && [ "$pname" != "$target" ] && continue
+
+    ptype=$(profile_type "$f")
+    printf "  Testing %-15s ... " "$pname"
+
+    if [ "$ptype" = "vertex" ]; then
+      # Vertex: check gcloud credentials exist
+      if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
+        local project region
+        project=$(json_get "$f" "env.ANTHROPIC_VERTEX_PROJECT_ID")
+        region=$(json_get "$f" "env.CLOUD_ML_REGION")
+        local token
+        token=$(gcloud auth application-default print-access-token 2>/dev/null || echo "")
+        if [ -n "$token" ]; then
+          echo -e "${GREEN}OK${RESET} (credentials valid, project: $project)"
+        else
+          echo -e "${RED}FAIL${RESET} (token expired, run: gcloud auth application-default login)"
+        fi
+      else
+        echo -e "${RED}FAIL${RESET} (no credentials)"
+      fi
+    else
+      # API key: send a minimal request
+      local url key
+      url=$(json_get "$f" "env.ANTHROPIC_BASE_URL")
+      key=$(json_get "$f" "env.ANTHROPIC_AUTH_TOKEN")
+      local model
+      model=$(json_get "$f" "env.ANTHROPIC_DEFAULT_HAIKU_MODEL")
+      [ -z "$model" ] || [ "$model" = "{}" ] && model="claude-haiku-4-5"
+
+      local http_code
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST "$url/v1/messages" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $key" \
+        -H "anthropic-version: 2023-06-01" \
+        -d "{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+        --connect-timeout 5 --max-time 10 2>/dev/null || echo "000")
+
+      if [ "$http_code" = "200" ]; then
+        echo -e "${GREEN}OK${RESET} ($url)"
+      elif [ "$http_code" = "000" ]; then
+        echo -e "${RED}FAIL${RESET} (connection timeout)"
+      elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+        echo -e "${RED}FAIL${RESET} (auth error $http_code — check API key)"
+      elif [ "$http_code" = "429" ]; then
+        echo -e "${YELLOW}RATE LIMITED${RESET} (endpoint reachable, but quota exceeded)"
+      else
+        echo -e "${YELLOW}HTTP $http_code${RESET} ($url)"
+      fi
+    fi
+  done
+  echo ""
+}
+
+# ── Backup / Restore ─────────────────────────────────────────────
+
+cmd_backup() {
+  if [ ! -f "$SETTINGS_FILE" ]; then
+    die "No settings.json to backup"
+  fi
+  local ts
+  ts=$(date +%Y%m%d-%H%M%S)
+  cp "$SETTINGS_FILE" "$BACKUP_DIR/settings.$ts.json"
+  ok "Backed up to: $BACKUP_DIR/settings.$ts.json"
+}
+
+cmd_restore() {
+  local target="${1:-}"
+
+  if [ -n "$target" ] && [ -f "$target" ]; then
+    # Restore from specific file
+    if python3 -c "import json; json.load(open('$target'))" 2>/dev/null; then
+      cp "$target" "$SETTINGS_FILE"
+      ok "Restored from: $target"
+    else
+      die "Invalid JSON: $target"
+    fi
+    return
+  fi
+
+  # List available backups
+  local backups
+  backups=$(ls -1t "$BACKUP_DIR"/settings.*.json 2>/dev/null)
+  if [ -z "$backups" ]; then
+    # Try the simple .bak file
+    if [ -f "$BACKUP_FILE" ]; then
+      cp "$BACKUP_FILE" "$SETTINGS_FILE"
+      ok "Restored from: $BACKUP_FILE"
+    else
+      die "No backups found"
+    fi
+    return
+  fi
+
+  echo -e "\n  ${BOLD}Available Backups${RESET}"
+  echo -e "  ${DIM}$(printf '─%.0s' {1..40})${RESET}"
+  local i=0
+  local files=()
+  while IFS= read -r f; do
+    i=$((i + 1))
+    files+=("$f")
+    local ts
+    ts=$(basename "$f" .json | sed 's/settings\.//')
+    printf "  ${DIM}%d)${RESET} %s\n" "$i" "$ts"
+  done <<< "$backups"
+  echo ""
+
+  read -rp "  Select [1-$i] or q to cancel: " choice
+  if [ "$choice" = "q" ] || [ -z "$choice" ]; then
+    echo -e "  ${DIM}Cancelled${RESET}"; return
+  fi
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$i" ]; then
+    die "Invalid selection"
+  fi
+
+  local selected="${files[$((choice - 1))]}"
+  cp "$selected" "$SETTINGS_FILE"
+  ok "Restored from: $(basename "$selected")"
+}
+
+# ── Export / Import ──────────────────────────────────────────────
+
+cmd_export() {
+  local output="${1:--}"
+  python3 -c "
+import json, os, sys
+
+profiles_dir = '$PROFILES_DIR'
+profiles = {}
+for f in sorted(os.listdir(profiles_dir)):
+    if f.endswith('.json'):
+        name = f[:-5]
+        with open(os.path.join(profiles_dir, f)) as fh:
+            profiles[name] = json.load(fh)
+
+export_data = {
+    'version': '$VERSION',
+    'profiles': profiles
+}
+
+output = '$output'
+if output == '-':
+    json.dump(export_data, sys.stdout, indent=2)
+    print()
+else:
+    with open(output, 'w') as f:
+        json.dump(export_data, f, indent=2)
+        f.write('\n')
+    print(f'  \033[32m[OK]\033[0m Exported {len(profiles)} profile(s) to {output}', file=sys.stderr)
+" 2>/dev/null
+}
+
+cmd_import() {
+  local input="${1:-}"
+  [ -z "$input" ] && die "Usage: layla import <file>"
+  [ -f "$input" ] || die "File not found: $input"
+
+  python3 -c "
+import json, os
+
+with open('$input') as f:
+    data = json.load(f)
+
+profiles = data.get('profiles', {})
+profiles_dir = '$PROFILES_DIR'
+imported = 0
+skipped = 0
+
+for name, profile in profiles.items():
+    target = os.path.join(profiles_dir, f'{name}.json')
+    if os.path.exists(target):
+        skipped += 1
+        continue
+    with open(target, 'w') as f:
+        json.dump(profile, f, indent=2)
+        f.write('\n')
+    imported += 1
+
+print(f'  \033[32m[OK]\033[0m Imported {imported} profile(s), skipped {skipped} existing')
+"
+}
+
+# ── Shell Completions ────────────────────────────────────────────
+
+cmd_completions() {
+  local shell="${1:-zsh}"
+  case "$shell" in
+    zsh)
+      cat << 'ZSHCOMP'
+#compdef layla
+
+_layla() {
+  local -a commands profiles
+  commands=(
+    'list:List profiles (non-interactive)'
+    'status:Show active profile details'
+    'add:Create new profile'
+    'rm:Remove a profile'
+    'test:API health check'
+    'doctor:Check configuration health'
+    'backup:Backup current settings'
+    'restore:Restore from backup'
+    'export:Export profiles to JSON'
+    'import:Import profiles from JSON'
+    'completions:Generate shell completions'
+    'version:Show version'
+    'help:Show help'
+  )
+
+  if (( CURRENT == 2 )); then
+    # Complete commands and profile names
+    profiles=(${(f)"$(ls ~/.claude/profiles/*.json 2>/dev/null | xargs -I{} basename {} .json)"})
+    _describe 'command' commands
+    _describe 'profile' profiles
+  elif (( CURRENT == 3 )); then
+    case "${words[2]}" in
+      rm|remove|test)
+        profiles=(${(f)"$(ls ~/.claude/profiles/*.json 2>/dev/null | xargs -I{} basename {} .json)"})
+        _describe 'profile' profiles
+        ;;
+      doctor)
+        _values 'flags' '--fix[Auto-repair issues]'
+        ;;
+      completions)
+        _values 'shell' 'zsh' 'bash' 'fish'
+        ;;
+    esac
+  fi
+}
+
+_layla "$@"
+ZSHCOMP
+      ;;
+    bash)
+      cat << 'BASHCOMP'
+_layla() {
+  local cur prev commands profiles
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  commands="list status add rm test doctor backup restore export import completions version help"
+  profiles=$(ls ~/.claude/profiles/*.json 2>/dev/null | xargs -I{} basename {} .json)
+
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$commands $profiles" -- "$cur") )
+  elif [ "$COMP_CWORD" -eq 2 ]; then
+    case "$prev" in
+      rm|remove|test) COMPREPLY=( $(compgen -W "$profiles" -- "$cur") ) ;;
+      doctor)         COMPREPLY=( $(compgen -W "--fix" -- "$cur") ) ;;
+      completions)    COMPREPLY=( $(compgen -W "zsh bash fish" -- "$cur") ) ;;
+    esac
+  fi
+}
+complete -F _layla layla
+BASHCOMP
+      ;;
+    fish)
+      cat << 'FISHCOMP'
+complete -c layla -f
+complete -c layla -n '__fish_use_subcommand' -a 'list' -d 'List profiles'
+complete -c layla -n '__fish_use_subcommand' -a 'status' -d 'Show active profile'
+complete -c layla -n '__fish_use_subcommand' -a 'add' -d 'Create new profile'
+complete -c layla -n '__fish_use_subcommand' -a 'rm' -d 'Remove a profile'
+complete -c layla -n '__fish_use_subcommand' -a 'test' -d 'API health check'
+complete -c layla -n '__fish_use_subcommand' -a 'doctor' -d 'Check config health'
+complete -c layla -n '__fish_use_subcommand' -a 'backup' -d 'Backup settings'
+complete -c layla -n '__fish_use_subcommand' -a 'restore' -d 'Restore from backup'
+complete -c layla -n '__fish_use_subcommand' -a 'export' -d 'Export profiles'
+complete -c layla -n '__fish_use_subcommand' -a 'import' -d 'Import profiles'
+complete -c layla -n '__fish_use_subcommand' -a 'completions' -d 'Shell completions'
+complete -c layla -n '__fish_use_subcommand' -a 'version' -d 'Show version'
+complete -c layla -n '__fish_use_subcommand' -a 'help' -d 'Show help'
+for profile in (ls ~/.claude/profiles/*.json 2>/dev/null | xargs -I{} basename {} .json)
+  complete -c layla -n '__fish_use_subcommand' -a "$profile" -d "Switch to $profile"
+end
+FISHCOMP
+      ;;
+    *)
+      die "Unsupported shell: $shell. Use: zsh, bash, fish"
+      ;;
+  esac
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+
+# Background update check (non-blocking)
+check_update_bg
 
 case "${1:-}" in
-  "")         cmd_list true ;;
-  list)       cmd_list false ;;
-  status)     cmd_status ;;
-  add)        [ -z "${2:-}" ] && die "Usage: layla add <name>"; cmd_add "$2" ;;
-  rm|remove)  [ -z "${2:-}" ] && die "Usage: layla rm <name>"; cmd_rm "$2" ;;
+  "")              cmd_list true; show_update_notice ;;
+  list)            cmd_list false ;;
+  status)          cmd_status ;;
+  add)             [ -z "${2:-}" ] && die "Usage: layla add <name>"; cmd_add "$2" ;;
+  rm|remove)       [ -z "${2:-}" ] && die "Usage: layla rm <name>"; cmd_rm "$2" ;;
+  test)            cmd_test "${2:-}" ;;
+  doctor)          cmd_doctor "${2:-}" ;;
+  backup)          cmd_backup ;;
+  restore)         cmd_restore "${2:-}" ;;
+  export)          cmd_export "${2:-}" ;;
+  import)          cmd_import "${2:-}" ;;
+  completions)     cmd_completions "${2:-zsh}" ;;
   version|-v|--version)
     echo "layla $VERSION"
     ;;
   help|-h|--help)
-    echo -e "  ${BOLD}layla${RESET} — Switch Claude Code profiles\n"
-    echo -e "  ${BOLD}Usage:${RESET}"
-    echo "    layla                 Interactive profile selector"
-    echo "    layla <name>          Switch to profile"
-    echo "    layla list            List profiles (non-interactive)"
-    echo "    layla status          Show active profile details"
-    echo "    layla add <name>      Create new profile (interactive)"
-    echo "    layla rm <name>       Remove a profile"
-    echo "    layla version         Show version"
-    echo "    layla help            Show this help"
+    echo -e "\n  ${BOLD}layla${RESET} v${VERSION} — Claude Code Profile Manager\n"
+    echo -e "  ${BOLD}USAGE${RESET}"
+    echo "    layla                    Interactive profile selector"
+    echo "    layla <name>             Switch to profile"
     echo ""
-    echo -e "  ${BOLD}Profile types:${RESET}"
-    echo "    API Key   — ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN"
-    echo "    Vertex AI — CLAUDE_CODE_USE_VERTEX + GCP project (Google OAuth)"
+    echo -e "  ${BOLD}COMMANDS${RESET}"
+    echo "    layla list               List profiles (non-interactive)"
+    echo "    layla status             Show active profile details"
+    echo "    layla add <name>         Create new profile"
+    echo "    layla rm <name>          Remove a profile"
+    echo "    layla test [name]        API health check (all or specific)"
+    echo "    layla doctor [--fix]     Check & repair configuration"
+    echo "    layla backup             Save current settings"
+    echo "    layla restore            Restore from backup (interactive)"
+    echo "    layla export [file]      Export all profiles to JSON"
+    echo "    layla import <file>      Import profiles from JSON"
+    echo "    layla completions [sh]   Generate shell completions (zsh/bash/fish)"
     echo ""
-    echo -e "  ${BOLD}Environment:${RESET}"
-    echo "    LAYLA_PROFILES_DIR    Profile directory (default: ~/.claude/profiles)"
-    echo "    LAYLA_SETTINGS_FILE   Settings file (default: ~/.claude/settings.json)"
+    echo -e "  ${BOLD}PROFILE TYPES${RESET}"
+    echo "    API Key      ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN"
+    echo "    Vertex AI    CLAUDE_CODE_USE_VERTEX + GCP project (Google OAuth)"
+    echo ""
+    echo -e "  ${BOLD}ENVIRONMENT${RESET}"
+    echo "    LAYLA_PROFILES_DIR      Profile directory (default: ~/.claude/profiles)"
+    echo "    LAYLA_SETTINGS_FILE     Settings file (default: ~/.claude/settings.json)"
+    echo "    NO_COLOR                Disable colors"
+    echo ""
     ;;
-  *)          cmd_switch "$1" ;;
+  *)               cmd_switch "$1" ;;
 esac
