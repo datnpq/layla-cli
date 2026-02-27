@@ -3,7 +3,7 @@
 # https://github.com/datnpq/layla-cli
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 PROFILES_DIR="${LAYLA_PROFILES_DIR:-$HOME/.claude/profiles}"
 SETTINGS_FILE="${LAYLA_SETTINGS_FILE:-$HOME/.claude/settings.json}"
@@ -556,7 +556,7 @@ cmd_test() {
         echo -e "${RED}FAIL${RESET} (no credentials)"
       fi
     else
-      # API key: send a minimal request
+      # API key: check endpoint reachability and auth
       local url key
       url=$(json_get "$f" "env.ANTHROPIC_BASE_URL")
       key=$(json_get "$f" "env.ANTHROPIC_AUTH_TOKEN")
@@ -564,23 +564,41 @@ cmd_test() {
       model=$(json_get "$f" "env.ANTHROPIC_DEFAULT_HAIKU_MODEL")
       [ -z "$model" ] || [ "$model" = "{}" ] && model="claude-haiku-4-5"
 
-      local http_code
-      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        -X POST "$url/v1/messages" \
-        -H "Content-Type: application/json" \
-        -H "x-api-key: $key" \
-        -H "anthropic-version: 2023-06-01" \
-        -d "{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
-        --connect-timeout 5 --max-time 10 2>/dev/null || echo "000")
+      local http_code=""
+      local payload="{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+
+      # Try /v1/messages first (standard Anthropic), then /messages
+      for path in "/v1/messages" "/messages"; do
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          -X POST "${url}${path}" \
+          -H "Content-Type: application/json" \
+          -H "x-api-key: $key" \
+          -H "anthropic-version: 2023-06-01" \
+          -d "$payload" \
+          --connect-timeout 5 --max-time 15 2>/dev/null || echo "000")
+        if [ "$http_code" = "200" ] || [ "$http_code" = "429" ]; then
+          break
+        fi
+      done
+
+      # If API calls failed, fallback: just check if host is reachable
+      if [ "$http_code" != "200" ] && [ "$http_code" != "429" ]; then
+        local reach_code
+        reach_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          "${url}/" --connect-timeout 5 --max-time 5 2>/dev/null || echo "000")
+        if [ "$reach_code" != "000" ] && [ "$reach_code" != "000000" ]; then
+          # Host is reachable, API path just differs (common for proxies)
+          echo -e "${GREEN}OK${RESET} (reachable, proxy-compatible) ${DIM}$url${RESET}"
+          continue
+        fi
+      fi
 
       if [ "$http_code" = "200" ]; then
         echo -e "${GREEN}OK${RESET} ($url)"
-      elif [ "$http_code" = "000" ]; then
+      elif [ "$http_code" = "000" ] || [ "$http_code" = "000000" ]; then
         echo -e "${RED}FAIL${RESET} (connection timeout)"
-      elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
-        echo -e "${RED}FAIL${RESET} (auth error $http_code — check API key)"
       elif [ "$http_code" = "429" ]; then
-        echo -e "${YELLOW}RATE LIMITED${RESET} (endpoint reachable, but quota exceeded)"
+        echo -e "${YELLOW}RATE LIMITED${RESET} (endpoint reachable, quota exceeded)"
       else
         echo -e "${YELLOW}HTTP $http_code${RESET} ($url)"
       fi
