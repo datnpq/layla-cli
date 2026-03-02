@@ -3,7 +3,7 @@
 # https://github.com/datnpq/layla-cli
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 PROFILES_DIR="${LAYLA_PROFILES_DIR:-$HOME/.claude/profiles}"
 SETTINGS_FILE="${LAYLA_SETTINGS_FILE:-$HOME/.claude/settings.json}"
