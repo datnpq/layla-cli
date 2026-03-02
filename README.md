@@ -7,7 +7,7 @@
   <a href="https://www.npmjs.com/package/layla-cli"><img src="https://img.shields.io/npm/v/layla-cli?color=blue&label=npm" alt="npm version"></a>
   <a href="https://github.com/datnpq/layla-cli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/datnpq/layla-cli" alt="license"></a>
   <img src="https://img.shields.io/badge/shell-bash-green" alt="bash">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="platform">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform">
 </p>
 
 ---
@@ -24,6 +24,15 @@ Switch between multiple Claude Code providers and API keys with a single command
 | **Architecture** | Single bash script | Multi-process daemon |
 
 Layla does one thing well: **switch Claude Code profiles**. It edits `~/.claude/settings.json` and gets out of your way.
+
+---
+
+## Prerequisites
+
+- **bash** — pre-installed on macOS/Linux; on Windows use [Git Bash](https://gitforwindows.org/) or WSL
+- **python3** — pre-installed on macOS/Linux; on Windows install from [python.org](https://www.python.org/downloads/) (layla auto-detects `python3` or `python`)
+
+> **Windows users:** Install via Git Bash or WSL. Native cmd/PowerShell is not supported — layla is a bash script.
 
 ---
 
@@ -103,7 +112,7 @@ layla test wokushop      # Test a specific profile
 ```
 
 `layla doctor` verifies:
-- python3 availability
+- Python availability (python3 or python)
 - profiles directory & JSON validity
 - settings.json integrity
 - gcloud credentials (for Vertex AI profiles)
@@ -246,7 +255,7 @@ Layla never touches anything outside `settings.json`. Your profiles, commands, s
 | Shell completions | Tab completion for zsh, bash, and fish |
 | Update notifications | Non-blocking daily check for new npm versions |
 | NO_COLOR support | Respects `NO_COLOR` env var and non-TTY pipes |
-| Zero dependencies | Just bash + python3 (pre-installed on macOS/Linux) |
+| Zero dependencies | Just bash + python3 (pre-installed on macOS/Linux; available via Git Bash on Windows) |
 
 ---
 

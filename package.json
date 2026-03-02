@@ -32,6 +32,7 @@
   },
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ]
 }

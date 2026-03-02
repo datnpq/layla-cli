@@ -15,9 +15,28 @@ UPDATE_CACHE="$HOME/.claude/.layla-update-check"
 mkdir -p "$PROFILES_DIR" "$BACKUP_DIR"
 [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
 
+# ── OS detection ─────────────────────────────────────────────────
+detect_os() {
+  case "$OSTYPE" in
+    darwin*)  echo "macos" ;;
+    msys*|mingw*|cygwin*) echo "windows" ;;
+    *)        echo "linux" ;;
+  esac
+}
+LAYLA_OS="$(detect_os)"
+
+# ── Python detection ─────────────────────────────────────────────
+if command -v python3 &>/dev/null; then
+  PYTHON="python3"
+elif command -v python &>/dev/null && python -c "import sys; assert sys.version_info[0]>=3" 2>/dev/null; then
+  PYTHON="python"
+else
+  echo "Error: python3 not found. Install Python 3 to use layla." >&2; exit 1
+fi
+
 # Validate settings.json is valid JSON, restore from backup if corrupted
-if ! python3 -c "import json; json.load(open('$SETTINGS_FILE'))" 2>/dev/null; then
-  if [ -f "$BACKUP_FILE" ] && python3 -c "import json; json.load(open('$BACKUP_FILE'))" 2>/dev/null; then
+if ! $PYTHON -c "import json; json.load(open('$SETTINGS_FILE'))" 2>/dev/null; then
+  if [ -f "$BACKUP_FILE" ] && $PYTHON -c "import json; json.load(open('$BACKUP_FILE'))" 2>/dev/null; then
     cp "$BACKUP_FILE" "$SETTINGS_FILE"
   else
     echo '{}' > "$SETTINGS_FILE"
@@ -79,7 +98,7 @@ show_update_notice() {
 
 # ── JSON helpers ─────────────────────────────────────────────────
 json_get() {
-  python3 -c "
+  $PYTHON -c "
 import json, sys
 data = json.load(open('$1'))
 keys = '$2'.split('.')
@@ -138,7 +157,7 @@ active_profile() {
 
 model_summary() {
   local file="$1" compact="${2:-false}"
-  python3 -c "
+  $PYTHON -c "
 import json
 d = json.load(open('$file')).get('env', {})
 parts = []
@@ -158,14 +177,14 @@ profile_endpoint() {
   else
     local url
     url=$(json_get "$file" "env.ANTHROPIC_BASE_URL")
-    python3 -c "from urllib.parse import urlparse; print(urlparse('$url').hostname or '$url')" 2>/dev/null
+    $PYTHON -c "from urllib.parse import urlparse; print(urlparse('$url').hostname or '$url')" 2>/dev/null
   fi
 }
 
 # ── Fuzzy match ──────────────────────────────────────────────────
 fuzzy_suggest() {
   local input="$1"
-  python3 -c "
+  $PYTHON -c "
 import os, json
 
 def levenshtein(s1, s2):
@@ -189,6 +208,23 @@ best = scored[0]
 if best[1] <= max(3, len('$input') // 2):
     print(best[0])
 " 2>/dev/null
+}
+
+# ── OS-aware gcloud helpers ──────────────────────────────────────
+gcloud_creds_file() {
+  if [ "$LAYLA_OS" = "windows" ] && [ -n "${APPDATA:-}" ]; then
+    local win_path="$APPDATA/gcloud/application_default_credentials.json"
+    if [ -f "$win_path" ]; then echo "$win_path"; return; fi
+  fi
+  echo "$HOME/.config/gcloud/application_default_credentials.json"
+}
+
+gcloud_install_hint() {
+  case "$LAYLA_OS" in
+    macos)   echo "brew install google-cloud-sdk" ;;
+    windows) echo "choco install gcloudsdk" ;;
+    *)       echo "sudo snap install google-cloud-cli --classic" ;;
+  esac
 }
 
 # ── Commands ─────────────────────────────────────────────────────
@@ -266,7 +302,7 @@ cmd_switch() {
   # Keep only last 10 backups
   ls -1t "$BACKUP_DIR"/settings.*.json 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true
 
-  python3 -c "
+  $PYTHON -c "
 import json
 with open('$profile') as f: prof = json.load(f)
 settings = {}
@@ -342,7 +378,7 @@ cmd_add() {
     read -rp "  Opus model [claude-opus-4-6]: " opus_model
     read -rp "  Sonnet model [claude-sonnet-4-6]: " sonnet_model
     read -rp "  Haiku model [claude-haiku-4-5@20251001]: " haiku_model
-    python3 -c "
+    $PYTHON -c "
 import json
 profile = {
     'description': '''${desc}''',
@@ -365,7 +401,7 @@ with open('$profile', 'w') as f:
     read -rp "  Opus model [claude-opus-4-6]: " opus_model
     read -rp "  Sonnet model [claude-sonnet-4-6]: " sonnet_model
     read -rp "  Haiku model [claude-haiku-4-5]: " haiku_model
-    python3 -c "
+    $PYTHON -c "
 import json
 profile = {
     'description': '''${desc}''',
@@ -404,12 +440,8 @@ cmd_doctor() {
   echo -e "\n  ${BOLD}Layla Doctor${RESET}"
   echo -e "  ${DIM}$(printf '─%.0s' {1..40})${RESET}\n"
 
-  # 1. Python3
-  if command -v python3 &>/dev/null; then
-    ok "python3 found: $(python3 --version 2>&1)"
-  else
-    die "python3 not found. Required for JSON handling."
-  fi
+  # 1. Python
+  ok "Python found: $($PYTHON --version 2>&1) ($PYTHON)"
 
   # 2. Profiles dir
   if [ -d "$PROFILES_DIR" ]; then
@@ -428,7 +460,7 @@ cmd_doctor() {
 
   # 3. Settings file
   if [ -f "$SETTINGS_FILE" ]; then
-    if python3 -c "import json; json.load(open('$SETTINGS_FILE'))" 2>/dev/null; then
+    if $PYTHON -c "import json; json.load(open('$SETTINGS_FILE'))" 2>/dev/null; then
       ok "settings.json: valid JSON"
     else
       issues=$((issues + 1))
@@ -459,7 +491,7 @@ cmd_doctor() {
     [ -f "$f" ] || continue
     local pname
     pname=$(basename "$f" .json)
-    if python3 -c "
+    if $PYTHON -c "
 import json
 d = json.load(open('$f'))
 assert 'env' in d, 'missing env'
@@ -480,7 +512,7 @@ assert 'env' in d, 'missing env'
       local pname
       pname=$(basename "$f" .json)
       if command -v gcloud &>/dev/null; then
-        if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
+        if [ -f "$(gcloud_creds_file)" ]; then
           ok "Vertex ($pname): gcloud credentials found"
         else
           issues=$((issues + 1))
@@ -488,7 +520,7 @@ assert 'env' in d, 'missing env'
         fi
       else
         issues=$((issues + 1))
-        warn "Vertex ($pname): gcloud CLI not installed. Run: brew install google-cloud-sdk"
+        warn "Vertex ($pname): gcloud CLI not installed. Run: $(gcloud_install_hint)"
       fi
       break  # Only check once
     fi
@@ -541,7 +573,7 @@ cmd_test() {
 
     if [ "$ptype" = "vertex" ]; then
       # Vertex: check gcloud credentials exist
-      if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
+      if [ -f "$(gcloud_creds_file)" ]; then
         local project region
         project=$(json_get "$f" "env.ANTHROPIC_VERTEX_PROJECT_ID")
         region=$(json_get "$f" "env.CLOUD_ML_REGION")
@@ -624,7 +656,7 @@ cmd_restore() {
 
   if [ -n "$target" ] && [ -f "$target" ]; then
     # Restore from specific file
-    if python3 -c "import json; json.load(open('$target'))" 2>/dev/null; then
+    if $PYTHON -c "import json; json.load(open('$target'))" 2>/dev/null; then
       cp "$target" "$SETTINGS_FILE"
       ok "Restored from: $target"
     else
@@ -677,7 +709,7 @@ cmd_restore() {
 
 cmd_export() {
   local output="${1:--}"
-  python3 -c "
+  $PYTHON -c "
 import json, os, sys
 
 profiles_dir = '$PROFILES_DIR'
@@ -710,7 +742,7 @@ cmd_import() {
   [ -z "$input" ] && die "Usage: layla import <file>"
   [ -f "$input" ] || die "File not found: $input"
 
-  python3 -c "
+  $PYTHON -c "
 import json, os
 
 with open('$input') as f:
